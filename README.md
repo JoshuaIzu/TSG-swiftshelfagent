@@ -55,11 +55,11 @@ Chord's native mechanism is **MCP**: register a remote Streamable-HTTP MCP serve
 - **State is in-memory.** Wallets live in a `SynchronizedRef`. Any server restart resets balances; keep one long-lived process, and note Paystack sessions created before a restart will credit `MerchantNotFound` (logged + ignored, not an error).
 - **Duplicate webhook deliveries are normal** — Paystack retries `charge.success`. `processedReferences` makes credit idempotent (verified: double delivery = single credit).
 - **MCP session semantics**: Chord is the MCP client; sessions are negotiated via `mcp-session-id`. The server keeps a transport map and cleans up on close. Bad/missing bearer → JSON-RPC 401-style error, never tool data.
-- **Public HTTPS is mandatory.** Chord's outbound policy rejects private/loopback URLs. ngrok free tier is fine (claim a static domain so the registration survives restarts); in production use a real domain behind TLS.
+- **Public HTTPS is mandatory.** Chord's outbound policy rejects private/loopback URLs. ngrok free tier is fine for dev (claim a static domain so the registration survives restarts); production here runs on InstaBox public ports — persistent HTTPS URLs that survive pause/resume and re-wake the machine on inbound webhook/MCP traffic.
 
 ## Running it
 
-Requirements: **Node ≥ 20**, npm, a Chord API key with `teammate:update` + MCP permissions, a Paystack test account, and a public HTTPS entrypoint (ngrok or a VPS).
+Requirements: **Node ≥ 20**, npm, a Chord API key with `teammate:update` + MCP permissions, a Paystack test account, and a public HTTPS entrypoint (ngrok for dev, or InstaBox/VPS public ports for production — see deployment).
 
 ```bash
 npm install
@@ -96,13 +96,49 @@ curl -X POST "$CHORD_BASE/v1/workspaces/$WS/mcp-servers" -H "Authorization: Bear
 - Dashboard → Settings → API Keys & Webhooks → Add endpoint: `https://<host>/api/paystack/webhook`, event `charge.success`, toggle **active**.
 - Test card: `4084 0840 8408 4081`, CVV `408`, any future expiry, OTP `123456`.
 
-### Deploying on a VPS
+### Deploying on a host with a public HTTPS URL
 
-1. `npm ci && npm run build` optional; simplest: `npm i -g tsx` (or keep ts-node) and run `node`-direct via `tsx server.ts`.
-2. Run under **pm2** or a systemd unit (single process — the ledger is in-memory; multiple replicas would not share wallet state).
-3. Terminate TLS in front of port 3000: Caddy `reverse_proxy localhost:3000` or nginx + certbot. Expose **80/443** only; `GET /health` is your liveness probe.
-4. Re-point the Chord MCP registration at the new URL (`PUT /v1/workspaces/{ws}/mcp-servers/{id}`) and update the Paystack webhook URL.
-5. Rotate every secret you used in dev (they've existed in a laptop `.env`).
+The production deployment runs on an **InstaBox** microVM (free 4 vCPU / 8 GiB machine), which replaces
+the ngrok/laptop dev loop entirely — its public-ports gateway provides persistent HTTPS with TLS,
+auto-wakes a paused machine on inbound request, and **pause/resume keeps running processes and memory
+intact** (the in-memory ledger survives idle pauses; only a full `stop` resets it).
+
+```bash
+# on the box
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs git
+git clone https://github.com/JoshuaIzu/TSG-swiftshelfagent.git swiftshelfagent && cd swiftshelfagent
+npm ci
+cp .env.example .env && chmod 600 .env        # fill real secrets; never commit
+
+sudo npm i -g pm2 tsx
+pm2 start "tsx server.ts" --name swiftshelf
+pm2 save
+pm2 logs swiftshelf --lines 10 --nostream      # expect: "listening on port 3000"
+
+instabox-port publish 3000 --name swiftshelf   # prints https://3000-<id>.instabox.tech
+curl -s https://3000-<id>.instabox.tech/health # liveness through the TLS gateway
+```
+
+Then re-point the two integrations at the new URL:
+
+```bash
+# Chord: update the MCP registration URL + force tool re-discovery
+curl -s -X PUT  "https://api.chordhq.xyz/v1/workspaces/$WS/mcp-servers/$MCP_ID" \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"url":"https://3000-<id>.instabox.tech/mcp","enabled":true}'
+curl -s -X POST "https://api.chordhq.xyz/v1/workspaces/$WS/mcp-servers/$MCP_ID/tools" \
+  -H "Authorization: Bearer $KEY"               # must return the five tool definitions
+```
+
+Paystack dashboard → API Keys & Webhooks → endpoint `https://3000-<id>.instabox.tech/api/paystack/webhook`, event `charge.success`, active.
+
+Optional but recommended: keep a free uptime monitor (e.g. UptimeRobot, 5-min GET `/health`) pointed at
+the URL — it doubles as keep-warm (no auto-pause mid-demo) and downtime alerting. Never `instabox stop`
+the machine manually; only ever let it auto-pause.
+
+On a conventional VPS: any TLS-terminating reverse proxy works (Caddy `reverse_proxy localhost:3000` or
+nginx + certbot on ports 80/443) — same pm2 run line, only the URL-provisioning step differs. Keep a
+**single process** (the in-memory ledger isn't shared across replicas) and rotate any dev-exposed secrets.
 
 ### Endpoints
 
